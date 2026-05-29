@@ -1,4 +1,4 @@
-# CNE_fin
+# Actinopterygii-specific CNE analysis
 
 Summary
 -------
