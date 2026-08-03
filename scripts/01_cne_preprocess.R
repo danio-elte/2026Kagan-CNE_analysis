@@ -20,31 +20,34 @@ source('custom_functions.R')
 
 ### OUTPUT DIRECTORY ###
 preproc_dir <- "../output/preprocessed"
+report_dir <- "../output/reports"
 dir.create(preproc_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(report_dir, showWarnings = FALSE, recursive = TRUE)
 
 ###############################################################################
 ### 1. READ CNE BED FILES                                                   ###
 ###############################################################################
 
-bed_colnames <- c(
-  "chromosome",
-  "start",
-  "end",
-  "cne_name",
-  "phastcons_score",
-  "strand"
+actinopteriigy_cne_gr <- read_cne_bed(
+  "../input/actinopterygii_specific_drer.bed"
+)
+gnathostomata_cne_gr <- read_cne_bed(
+  "../input/gnathostomata_conserved_drer.bed"
 )
 
+# Raw tables are still needed for the YueSong key, which is built on cne_name.
 actinopteriigy_cne <- read_tsv(
   "../input/actinopterygii_specific_drer.bed",
-  col_names = FALSE
+  col_names = c(
+    "chromosome",
+    "start",
+    "end",
+    "cne_name",
+    "phastcons_score",
+    "strand"
+  ),
+  show_col_types = FALSE
 )
-gnathostomata_cne <- read_tsv(
-  "../input/gnathostomata_conserved_drer.bed",
-  col_names = FALSE
-)
-colnames(actinopteriigy_cne) <- bed_colnames
-colnames(gnathostomata_cne) <- bed_colnames
 
 ###############################################################################
 ### 2. READ CHROMOSOME SIZES AND BUILD TxDb                                 ###
@@ -52,10 +55,11 @@ colnames(gnathostomata_cne) <- bed_colnames
 
 drer_sizes <- read_tsv(
   "../ancilliary_files/drer_chrom_info.txt",
-  col_names = FALSE
+  col_names = c("chrom", "length"),
+  show_col_types = FALSE
 ) %>%
-  filter(X2 > 20000)
-colnames(drer_sizes) <- c("chrom", "length")
+  filter(length > 20000) %>%
+  mutate(chrom = sub("\\.[0-9]+$", "", chrom))
 
 drer_anno <- txdbmaker::makeTxDbFromGFF(
   "../ancilliary_files/drer.gff",
@@ -98,61 +102,26 @@ gene_activity <- salmon_tpm %>%
 saveRDS(gene_activity, file.path(preproc_dir, "gene_activity.rds"))
 
 ###############################################################################
-### 4. BUILD CNE GRanges WITH PROPER SEQINFO                                ###
+### 4. INJECT SEQLENGTHS                                                    ###
 ###############################################################################
 
-# Build CNE GRanges. Seqnames come from `cne_name` with version stripped,
-# matching downstream usage.
-actinopteriigy_cne_gr <- GRanges(
-  seqnames = sub("\\.[0-9]+$", "", actinopteriigy_cne$cne_name),
-  ranges = IRanges(actinopteriigy_cne$start, actinopteriigy_cne$end),
-  phastcons = actinopteriigy_cne$phastcons_score
-)
-gnathostomata_cne_gr <- GRanges(
-  seqnames = sub("\\.[0-9]+$", "", gnathostomata_cne$cne_name),
-  ranges = IRanges(gnathostomata_cne$start, gnathostomata_cne$end),
-  phastcons = gnathostomata_cne$phastcons_score
-)
+inject_seqlengths <- function(gr, sizes) {
+  sl <- setNames(rep(NA_real_, length(seqlevels(gr))), seqlevels(gr))
+  m <- match(names(sl), sizes$chrom)
+  sl[!is.na(m)] <- sizes$length[m[!is.na(m)]]
 
-# Width filter
-actinopteriigy_cne_gr <- actinopteriigy_cne_gr[
-  width(actinopteriigy_cne_gr) > 25
-]
-gnathostomata_cne_gr <- gnathostomata_cne_gr[
-  width(gnathostomata_cne_gr) > 25
-]
+  if (anyNA(sl)) {
+    warning(
+      "No length available for: ",
+      paste(names(sl)[is.na(sl)], collapse = ", ")
+    )
+  }
+  seqlengths(gr) <- sl
+  gr
+}
 
-# --- Reconcile chromosome naming and inject seqlengths -----------------------
-crossmapping <- data.frame(
-  nonstrip = seqlevels(actinopteriigy_cne_gr),
-  stripped = sub('\\.[0-9]+$', '', seqlevels(actinopteriigy_cne_gr))
-)
-drer_sizes$chrom <- crossmapping$nonstrip[match(
-  drer_sizes$chrom,
-  crossmapping$stripped
-)]
-
-# Strip version suffixes from both sides and match
-drer_sizes$chrom_base <- sub("\\..*", "", drer_sizes$chrom)
-sl_base <- sub("\\..*", "", names(seqlengths(actinopteriigy_cne_gr)))
-
-sl <- seqlengths(actinopteriigy_cne_gr)
-names(sl) <- sl_base # temporarily strip versions
-
-sl[drer_sizes$chrom_base] <- drer_sizes$length
-
-names(sl) <- seqlevels(actinopteriigy_cne_gr) # restore original names
-seqlengths(actinopteriigy_cne_gr) <- sl
-
-sl_base <- sub("\\..*", "", names(seqlengths(gnathostomata_cne_gr)))
-
-sl <- seqlengths(gnathostomata_cne_gr)
-names(sl) <- sl_base # temporarily strip versions
-
-sl[drer_sizes$chrom_base] <- drer_sizes$length
-
-names(sl) <- seqlevels(gnathostomata_cne_gr) # restore original names
-seqlengths(gnathostomata_cne_gr) <- sl
+actinopteriigy_cne_gr <- inject_seqlengths(actinopteriigy_cne_gr, drer_sizes)
+gnathostomata_cne_gr <- inject_seqlengths(gnathostomata_cne_gr, drer_sizes)
 
 ###############################################################################
 ### 5. IMPORT EXTERNAL DATASETS                                             ###
@@ -188,7 +157,8 @@ sheet7_gr <- GRanges(
 # --- Liftover of actinopteriigy CNEs to GRCz12 for overlap with sheet 7 ------
 liftover <- read_tsv(
   "../input/ucsc_GRCz11-GRCz12_liftover_actinopteriigy_cne.bed",
-  col_names = FALSE
+  col_names = FALSE,
+  show_col_types = FALSE
 )
 liftover_gr <- GRanges(
   seqnames = liftover$X1,
@@ -199,12 +169,21 @@ liftover_gr <- GRanges(
 hits <- findOverlaps(liftover_gr, sheet7_gr, ignore.strand = TRUE)
 overlapping_cne_names <- unique(mcols(liftover_gr)$cne_name[queryHits(hits)])
 actinopteriigy_cne_ov <- actinopteriigy_cne %>%
-  filter(cne_name %in% overlapping_cne_names)
+  filter(cne_name %in% overlapping_cne_names) %>%
+  mutate(start = start + 1L)
 
 # --- Chan et al EP-loops + enhancer / promoter calls (GRCz12) ----------------
-ep <- read_tsv("../input/Chan_et_al_EP-loops.tsv")
-en <- read_tsv("../ancilliary_files/enhancer.grcz12.bed", col_names = FALSE)
-pr <- read_tsv("../ancilliary_files/promoter.grcz12.bed", col_names = FALSE)
+ep <- read_tsv("../input/Chan_et_al_EP-loops.tsv", show_col_types = FALSE)
+en <- read_tsv(
+  "../ancilliary_files/enhancer.grcz12.bed",
+  col_names = FALSE,
+  show_col_types = FALSE
+)
+pr <- read_tsv(
+  "../ancilliary_files/promoter.grcz12.bed",
+  col_names = FALSE,
+  show_col_types = FALSE
+)
 
 enh_gr <- GRanges(
   seqnames = en$X1,
@@ -215,7 +194,8 @@ enh_gr <- GRanges(
 # --- ATAC consensus peaks ----------------------------------------------------
 atac_peaks <- read_tsv(
   "../input/consensus_peaks.mLb.clN.bed",
-  col_names = FALSE
+  col_names = FALSE,
+  show_col_types = FALSE
 )
 colnames(atac_peaks) <- c(
   "chromosome",
@@ -227,32 +207,98 @@ colnames(atac_peaks) <- c(
 )
 atac_peaks_gr <- GRanges(
   seqnames = atac_peaks$chromosome,
-  ranges = IRanges(start = atac_peaks$start, end = atac_peaks$end),
+  ranges = IRanges(start = atac_peaks$start + 1L, end = atac_peaks$end),
   peak_name = atac_peaks$peak_name,
   score = atac_peaks$score
 )
 
 ###############################################################################
+### 5b. EXON EXCLUSION                                                      ###
+###############################################################################
+# phastCons is run over the full alignment; the GFF passed to the workflow is
+# used for 4D-site extraction and neutral-model estimation, not as a mask, and
+# the classification step separates the clade sets without subtracting exons.
+# The BED files therefore contain conserved elements of any class, and coding
+# exons — being the most constrained sequence in the genome — are strongly
+# represented. Elements overlapping an annotated exon are removed here, by
+# coordinate, so that "non-coding" is enforced explicitly rather than emerging
+# as a by-product of which label ChIPseeker happens to assign to elements that
+# overlap several feature classes at once.
+
+exon_gr <- GenomicRanges::reduce(exons(drer_anno), ignore.strand = TRUE)
+
+drop_exonic <- function(gr, exons_gr) {
+  shared <- intersect(seqlevels(gr), seqlevels(exons_gr))
+  if (!length(shared)) {
+    stop(
+      "CNE and exon seqlevels do not intersect; check accession versioning.\n",
+      "  CNE:  ",
+      paste(head(seqlevels(gr), 3), collapse = ", "),
+      "\n  exon: ",
+      paste(head(seqlevels(exons_gr), 3), collapse = ", ")
+    )
+  }
+  gr <- GenomeInfoDb::keepSeqlevels(gr, shared, pruning.mode = "coarse")
+  subsetByOverlaps(
+    gr,
+    GenomeInfoDb::keepSeqlevels(exons_gr, shared, pruning.mode = "coarse"),
+    invert = TRUE,
+    ignore.strand = TRUE
+  )
+}
+
+exon_exclusion <- tibble(
+  set = c("actinopterygii_specific", "gnathostomata_conserved"),
+  n_input = c(length(actinopteriigy_cne_gr), length(gnathostomata_cne_gr))
+)
+
+actinopteriigy_cne_gr <- drop_exonic(actinopteriigy_cne_gr, exon_gr)
+gnathostomata_cne_gr <- drop_exonic(gnathostomata_cne_gr, exon_gr)
+
+exon_exclusion <- exon_exclusion %>%
+  mutate(
+    n_non_exonic = c(
+      length(actinopteriigy_cne_gr),
+      length(gnathostomata_cne_gr)
+    ),
+    n_removed = n_input - n_non_exonic,
+    percent_removed = round(100 * n_removed / n_input, 1)
+  )
+
+write_tsv(exon_exclusion, file.path(report_dir, "exon_exclusion_summary.tsv"))
+print(exon_exclusion)
+
+###############################################################################
 ### 6. ChIPseeker ANNOTATION + GENE-ACTIVITY JOIN                           ###
 ###############################################################################
+# Run on the already exon-free sets, so the annotation priority now only affects
+# how the remaining non-coding elements are described (promoter vs intron vs
+# distal) and no longer determines how many elements survive.
 
 peak_anno_list <- lapply(
   list(actinopteriigy_cne_gr, gnathostomata_cne_gr),
   annotatePeak,
   overlap = "all",
   TxDb = drer_anno,
-  tssRegion = c(-3000, 3000),
-  genomicAnnotationPriority = c(
-    "Intergenic",
-    "Downstream",
-    "Promoter",
-    "5UTR",
-    "3UTR",
-    "Intron",
-    "Exon"
-  )
+  tssRegion = c(-3000, 3000)
 )
 names(peak_anno_list) <- c("actinopteriigy_CNE", "gnathostomata_CNE")
+
+# Annotation-class composition under the default priority. Reported because the
+# switch away from the custom ordering moves elements between classes, and
+# because Exon-annotated elements are dropped by non_exon() further down.
+annotation_composition <- imap_dfr(peak_anno_list, function(obj, nm) {
+  as_tibble(obj@anno) %>%
+    mutate(annotation_class = str_remove(annotation, " \\(.*$")) %>%
+    dplyr::count(annotation_class, name = "n") %>%
+    mutate(set = nm, percent = round(100 * n / sum(n), 1))
+}) %>%
+  arrange(set, desc(n))
+
+write_tsv(
+  annotation_composition,
+  file.path(report_dir, "annotation_composition_default_priority.tsv")
+)
 
 peak_anno_list <- lapply(peak_anno_list, function(anno_obj) {
   anno_df <- as_tibble(anno_obj@anno) %>%
@@ -261,6 +307,24 @@ peak_anno_list <- lapply(peak_anno_list, function(anno_obj) {
   anno_obj@anno <- non_exon(anno_obj@anno)
   anno_obj
 })
+
+# Element counts surviving the exon / expression filter, for the Methods.
+# Counts entering and leaving the annotation step. `n_non_exonic` is the input
+# after the coordinate-level exon exclusion above, so any further loss here is
+# attributable to non_exon() and to elements whose nearest gene has no
+# expression measurement, not to exon overlap.
+filter_summary <- tibble(
+  set = c("actinopterygii_specific", "gnathostomata_conserved"),
+  n_non_exonic = c(length(actinopteriigy_cne_gr), length(gnathostomata_cne_gr)),
+  n_retained = c(
+    length(peak_anno_list$actinopteriigy_CNE@anno),
+    length(peak_anno_list$gnathostomata_CNE@anno)
+  )
+) %>%
+  mutate(percent_retained = round(100 * n_retained / n_non_exonic, 1))
+
+write_tsv(filter_summary, file.path(report_dir, "cne_filter_summary.tsv"))
+print(filter_summary)
 
 write.table(
   as.data.frame(non_exon(peak_anno_list$gnathostomata_CNE@anno)),
@@ -280,7 +344,95 @@ write.table(
 )
 
 ###############################################################################
-### 7. PERSIST EVERYTHING DOWNSTREAM SCRIPTS NEED                           ###
+### 7. SARCOPTERYGII-SPECIFIC SET (HUMAN COORDINATES)                       ###
+###############################################################################
+
+hsap_files <- list(
+  sarcopterygii = "../input/sarcopterygii_specific_hsap.bed",
+  gnathostomata = "../input/gnathostomata_conserved_hsap.bed"
+)
+hsap_sizes_file <- "../ancilliary_files/hsap_chrom_info.txt"
+hsap_gff_file <- "../ancilliary_files/hsap.gff"
+
+if (all(file.exists(unlist(hsap_files), hsap_sizes_file, hsap_gff_file))) {
+  hsap_sizes <- read_tsv(
+    hsap_sizes_file,
+    col_names = c("chrom", "length"),
+    show_col_types = FALSE
+  ) %>%
+    filter(length > 20000) %>%
+    mutate(chrom = sub("\\.[0-9]+$", "", chrom))
+
+  hsap_cne_gr <- lapply(hsap_files, read_cne_bed)
+  hsap_cne_gr <- lapply(hsap_cne_gr, inject_seqlengths, sizes = hsap_sizes)
+
+  # Human exon set, built from a human GFF on the same assembly the human CNEs
+  # were called against. drop_exonic() is reused unchanged; it intersects
+  # seqlevels itself, so a versioning mismatch stops with a clear error rather
+  # than silently removing nothing.
+  hsap_txdb <- txdbmaker::makeTxDbFromGFF(
+    hsap_gff_file,
+    organism = "Homo sapiens"
+  )
+  hsap_exon_gr <- GenomicRanges::reduce(
+    exons(hsap_txdb),
+    ignore.strand = TRUE
+  )
+
+  hsap_exon_exclusion <- imap_dfr(hsap_cne_gr, function(gr, nm) {
+    tibble(set = nm, reference = "hsap", n_input = length(gr))
+  })
+
+  hsap_cne_gr$sarcopterygii <- drop_exonic(
+    hsap_cne_gr$sarcopterygii,
+    exons_gr = hsap_exon_gr
+  )
+  hsap_cne_gr$gnathostomata <- drop_exonic(
+    hsap_cne_gr$gnathostomata,
+    exons_gr = hsap_exon_gr
+  )
+
+  hsap_exon_exclusion <- hsap_exon_exclusion %>%
+    mutate(
+      n_non_exonic = vapply(hsap_cne_gr, length, integer(1)),
+      n_removed = n_input - n_non_exonic,
+      percent_removed = round(100 * n_removed / n_input, 1)
+    )
+
+  write_tsv(
+    hsap_exon_exclusion,
+    file.path(report_dir, "hsap_exon_exclusion_summary.tsv")
+  )
+  print(hsap_exon_exclusion)
+
+  saveRDS(hsap_cne_gr, file.path(preproc_dir, "hsap_cne_gr.rds"))
+  saveRDS(hsap_sizes, file.path(preproc_dir, "hsap_sizes.rds"))
+
+  hsap_summary <- imap_dfr(hsap_cne_gr, function(gr, nm) {
+    tibble(
+      set = nm,
+      reference = "hsap",
+      n_elements = length(gr),
+      total_bp = sum(as.numeric(width(gr))),
+      median_width = median(width(gr)),
+      mean_width = round(mean(width(gr)), 1)
+    )
+  })
+  write_tsv(hsap_summary, file.path(report_dir, "hsap_cne_summary.tsv"))
+  print(hsap_summary)
+} else {
+  message(
+    "Human-coordinate CNE BEDs / GFF not found; skipping the sarcopterygii set.\n",
+    "  Expected: ",
+    paste(
+      c(unlist(hsap_files), hsap_sizes_file, hsap_gff_file),
+      collapse = ", "
+    )
+  )
+}
+
+###############################################################################
+### 8. PERSIST EVERYTHING DOWNSTREAM SCRIPTS NEED                           ###
 ###############################################################################
 
 # CNE GRanges (consumed by both scripts 2 and 3)
@@ -298,6 +450,9 @@ saveRDS(drer_sizes, file.path(preproc_dir, "drer_sizes.rds"))
 
 # TxDb (saved via SQLite path; reload with loadDb())
 txdb_path <- file.path(preproc_dir, "drer_anno.sqlite")
+if (file.exists(txdb_path)) {
+  file.remove(txdb_path)
+}
 AnnotationDbi::saveDb(drer_anno, txdb_path)
 
 # ChIPseeker output + per-CNE activity (used by script 3)
